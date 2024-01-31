@@ -1,11 +1,12 @@
-# Sending to Syslog in Rust
+# Sending to Syslog in Rust for ESP32
 
-[![Build Status](https://travis-ci.org/Geal/rust-syslog.png?branch=master)](https://travis-ci.org/Geal/rust-syslog)
-[![Coverage Status](https://coveralls.io/repos/Geal/rust-syslog/badge.svg?branch=master&service=github)](https://coveralls.io/github/Geal/rust-syslog?branch=master)
+This is a fork of https://github.com/Geal/rust-syslog that removes the incompatible compilation options for an esp32 using the esp rust channel
 
-A small library to write to local syslog.
+A small library to write to a remote syslog.
 
 ## Installation
+
+FIXME
 
 syslog is available on [crates.io](https://crates.io/crates/syslog) and can be included in your Cargo enabled project like this:
 
@@ -15,6 +16,8 @@ syslog = "^6.0"
 ```
 
 ## documentation
+
+FIXME
 
 Reference documentation is available [here](https://docs.rs/syslog).
 
@@ -71,6 +74,5 @@ fn main() {
 
 There are 3 functions to create loggers:
 
-* the `unix` function sends to the local syslog through a Unix socket: `syslog::unix(formatter)`
 * the `tcp` function takes an address for a remote TCP syslog server: `tcp(formatter, "127.0.0.1:4242")`
 * the `udp` function takes an address for a local port, and the address remote UDP syslog server: `udp(formatter, "127.0.0.1:1234", "127.0.0.1:4242")`
