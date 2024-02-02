@@ -5,8 +5,6 @@ use time;
 
 use errors::*;
 use facility::Facility;
-use get_hostname;
-use get_process_info;
 use Priority;
 
 #[allow(non_camel_case_types)]
@@ -118,8 +116,9 @@ impl Default for Formatter3164 {
     /// [`std::env::current_exe`]: https://doc.rust-lang.org/std/env/fn.current_exe.html
     /// [the `hostname` crate]: https://crates.io/crates/hostname
     fn default() -> Self {
-        let (process, pid) = get_process_info().unwrap_or((String::new(), std::process::id()));
-        let hostname = get_hostname().ok();
+        let process = "main".to_string();
+        let pid: u32 = 0;
+        let hostname = Some("undefined".to_string());
 
         Self {
             facility: Default::default(),

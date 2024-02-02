@@ -1,7 +1,7 @@
-extern crate syslog;
+extern crate esp_syslog;
 
 use std::collections::HashMap;
-use syslog::{Facility, Formatter5424};
+use esp_syslog::{Facility, Formatter5424, TcpStream, LoggerBackend, BufWriter};
 
 fn main() {
     let formatter = Formatter5424 {
@@ -11,7 +11,9 @@ fn main() {
         pid: 0,
     };
 
-    match syslog::unix(formatter) {
+    let tcp_server = TcpStream::connect(("127.0.0.1", 601)).map(|s| LoggerBackend::Tcp(BufWriter::new(s)));
+
+    match esp_syslog::tcp(formatter, tcp_server) {
         Err(e) => println!("impossible to connect to syslog: {:?}", e),
         Ok(mut writer) => {
             writer

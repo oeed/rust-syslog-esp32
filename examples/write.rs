@@ -1,6 +1,6 @@
-extern crate syslog;
+extern crate esp_syslog;
 
-use syslog::{Facility, Formatter3164};
+use esp_syslog::{Facility, Formatter3164, TcpStream, LoggerBackend, BufWriter};
 
 fn main() {
     let formatter = Formatter3164 {
@@ -10,7 +10,9 @@ fn main() {
         pid: 0,
     };
 
-    match syslog::unix(formatter) {
+    let tcp_server = TcpStream::connect(("127.0.0.1", 601)).map(|s| LoggerBackend::Tcp(BufWriter::new(s)));
+
+    match esp_syslog::tcp(formatter, tcp_server) {
         Err(e) => println!("impossible to connect to syslog: {:?}", e),
         Ok(mut writer) => {
             writer
