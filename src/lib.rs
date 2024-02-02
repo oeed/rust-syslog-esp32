@@ -214,6 +214,7 @@ pub fn tcp<T: ToSocketAddrs, F>(formatter: F, server: T) -> Result<Logger<Logger
         })
 }
 
+#[derive(Clone)]
 pub struct BasicLogger {
     logger: Arc<Mutex<Logger<LoggerBackend, Formatter3164>>>,
 }
@@ -266,10 +267,9 @@ pub fn init_udp<T: ToSocketAddrs>(
         process,
         pid,
     };
-    udp(formatter, local, server).and_then(|logger| {
-        log::set_boxed_logger(Box::new(BasicLogger::new(logger)))
-            .chain_err(|| ErrorKind::Initialization)
-    })?;
+    let logger = udp(formatter, local, server).unwrap();
+    let basic_logger = Box::new(BasicLogger::new(logger));
+    log::set_logger(Box::leak(basic_logger)).chain_err(|| ErrorKind::Initialization)?;
 
     log::set_max_level(log_level);
     Ok(())
@@ -291,10 +291,9 @@ pub fn init_tcp<T: ToSocketAddrs>(
         pid,
     };
 
-    tcp(formatter, server).and_then(|logger| {
-        log::set_boxed_logger(Box::new(BasicLogger::new(logger)))
-            .chain_err(|| ErrorKind::Initialization)
-    })?;
+    let logger = tcp(formatter, server).unwrap();
+    let basic_logger = Box::new(BasicLogger::new(logger));
+    log::set_logger(Box::leak(basic_logger)).chain_err(|| ErrorKind::Initialization)?;
 
     log::set_max_level(log_level);
     Ok(())
