@@ -14,7 +14,6 @@
 //!
 //! let formatter = Formatter3164 {
 //!     facility: Facility::LOG_USER,
-//!     hostname: "esp32-mydeviceid".into(),
 //!     process: "myprogram".into(),
 //!     pid: 0,
 //! };
@@ -39,7 +38,6 @@
 //!
 //! let formatter = Formatter3164 {
 //!     facility: Facility::LOG_USER,
-//!     hostname: "esp32-mydeviceid".into(),
 //!     process: "myprogram".into(),
 //!     pid: 0,
 //! };
@@ -61,11 +59,13 @@
 extern crate error_chain;
 extern crate log;
 extern crate time;
+extern crate esp_idf_svc;
 
 use std::fmt::{self, Arguments};
 use std::io::{self, BufWriter, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::AtomicUsize;
 
 use log::{Level, Log, Metadata, Record};
 
@@ -79,6 +79,14 @@ pub use format::Severity;
 pub use format::{Formatter3164, Formatter5424, LogFormat};
 
 pub type Priority = u8;
+
+static mut HOSTNAME: Option<String> = None;
+static STATE: AtomicUsize = AtomicUsize::new(0);
+
+// There are two different states that we care about: the logger's
+// UNINITIALIZED (no network connection), the network is available (INITIALIZED)
+const UNINITIALIZED: usize = 0;
+const INITIALIZED: usize = 1;
 
 /// Main logging structure
 pub struct Logger<Backend: Write, Formatter> {
@@ -197,9 +205,12 @@ pub fn udp<T: ToSocketAddrs, F>(
         .and_then(|server_addr| {
             UdpSocket::bind(local)
                 .chain_err(|| ErrorKind::Initialization)
-                .map(|socket| Logger {
-                    formatter,
-                    backend: LoggerBackend::Udp(socket, server_addr),
+                .map(|socket| {
+                    socket.connect(server_addr.clone()).unwrap();
+                    Logger {
+                        formatter,
+                        backend: LoggerBackend::Udp(socket, server_addr),
+                    }
                 })
         })
 }
@@ -217,12 +228,16 @@ pub fn tcp<T: ToSocketAddrs, F>(formatter: F, server: T) -> Result<Logger<Logger
 #[derive(Clone)]
 pub struct BasicLogger {
     logger: Arc<Mutex<Logger<LoggerBackend, Formatter3164>>>,
+    esp_logger: Arc<Mutex<esp_idf_svc::log::EspLogger>>,
 }
 
 impl BasicLogger {
     pub fn new(logger: Logger<LoggerBackend, Formatter3164>) -> BasicLogger {
+        let esp_logger = esp_idf_svc::log::EspLogger{};
+        esp_logger.set_target_level("main", log::LevelFilter::Info).expect("Failed to set target level");
         BasicLogger {
             logger: Arc::new(Mutex::new(logger)),
+            esp_logger: Arc::new(Mutex::new(esp_logger)),
         }
     }
 }
@@ -236,14 +251,23 @@ impl Log for BasicLogger {
     fn log(&self, record: &Record) {
         //FIXME: temporary patch to compile
         let message = format!("{}", record.args());
-        let mut logger = self.logger.lock().unwrap();
-        match record.level() {
-            Level::Error => logger.err(message),
-            Level::Warn => logger.warning(message),
-            Level::Info => logger.info(message),
-            Level::Debug => logger.debug(message),
-            Level::Trace => logger.debug(message),
-        };
+        let esp_logger = self.esp_logger.lock().unwrap();
+        esp_logger.log(record);
+        match STATE.load(std::sync::atomic::Ordering::Relaxed) {
+            INITIALIZED => {
+                let mut logger = self.logger.lock().unwrap();
+                match record.level() {
+                    Level::Error => logger.err(message),
+                    Level::Warn => logger.warning(message),
+                    Level::Info => logger.info(message),
+                    Level::Debug => logger.debug(message),
+                    Level::Trace => logger.debug(message),
+                };
+            },
+            UNINITIALIZED => {}, // uninitialized
+            _ => {} // uninitialized
+        }
+
     }
 
     fn flush(&self) {
@@ -255,7 +279,6 @@ impl Log for BasicLogger {
 pub fn init_udp<T: ToSocketAddrs>(
     local: T,
     server: T,
-    hostname: String,
     facility: Facility,
     log_level: log::LevelFilter,
     process: String,
@@ -263,7 +286,6 @@ pub fn init_udp<T: ToSocketAddrs>(
 ) -> Result<()> {
     let formatter = Formatter3164 {
         facility,
-        hostname: Some(hostname),
         process,
         pid,
     };
@@ -278,7 +300,6 @@ pub fn init_udp<T: ToSocketAddrs>(
 /// TCP Logger init function compatible with log crate
 pub fn init_tcp<T: ToSocketAddrs>(
     server: T,
-    hostname: String,
     facility: Facility,
     log_level: log::LevelFilter,
     process: String,
@@ -286,7 +307,6 @@ pub fn init_tcp<T: ToSocketAddrs>(
 ) -> Result<()> {
     let formatter = Formatter3164 {
         facility,
-        hostname: Some(hostname),
         process,
         pid,
     };
@@ -297,4 +317,21 @@ pub fn init_tcp<T: ToSocketAddrs>(
 
     log::set_max_level(log_level);
     Ok(())
+}
+
+pub fn set_network_available() {
+    STATE.store(INITIALIZED, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub unsafe fn set_hostname(hostname: String) {
+    HOSTNAME = Some(hostname);
+}
+
+pub fn get_hostname() -> String {
+    unsafe {
+        match HOSTNAME.clone() {
+            None => "esp32-unknown".to_string(),
+            Some(s) => s.clone(),
+        }
+    }
 }
