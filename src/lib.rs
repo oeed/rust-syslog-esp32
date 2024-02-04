@@ -249,7 +249,6 @@ impl Log for BasicLogger {
     }
 
     fn log(&self, record: &Record) {
-        //FIXME: temporary patch to compile
         let message = format!("{}", record.args());
         let esp_logger = self.esp_logger.lock().unwrap();
         esp_logger.log(record);
