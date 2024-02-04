@@ -6,7 +6,6 @@ use esp_syslog::{Facility, Formatter5424, TcpStream, LoggerBackend, BufWriter};
 fn main() {
     let formatter = Formatter5424 {
         facility: Facility::LOG_USER,
-        hostname: None,
         process: "myprogram".into(),
         pid: 0,
     };
