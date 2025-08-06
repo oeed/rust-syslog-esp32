@@ -233,7 +233,7 @@ pub struct BasicLogger {
 
 impl BasicLogger {
     pub fn new(logger: Logger<LoggerBackend, Formatter3164>) -> BasicLogger {
-        let esp_logger = esp_idf_svc::log::EspLogger{};
+        let esp_logger = esp_idf_svc::log::EspLogger::default();
         esp_logger.set_target_level("main", log::LevelFilter::Info).expect("Failed to set target level");
         BasicLogger {
             logger: Arc::new(Mutex::new(logger)),
