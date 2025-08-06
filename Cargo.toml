@@ -12,7 +12,8 @@ keywords = ["syslog", "logs", "logging", "esp", "esp32"]
 time        = { version = "0.3.5", features = ["local-offset", "formatting"] }
 log         = { version = "0.4.20"}
 error-chain = { version = "0.12.2", default-features = false }
-esp-idf-svc  = { version = "0.51", features = ["espidf"]}
+esp-idf-svc  = { version = "0.51"}
 
 [build-dependencies]
-embuild = "=0.31.4"
+embuild = "0.33"
+
