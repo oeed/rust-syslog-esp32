@@ -15,5 +15,5 @@ error-chain = { version = "0.12.2", default-features = false }
 esp-idf-svc  = { version = "0.51"}
 
 [build-dependencies]
-embuild = "0.33"
+embuild = {version="0.33", features=["espidf"]}
 
