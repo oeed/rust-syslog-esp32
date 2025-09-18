@@ -5,7 +5,7 @@ description = "Syslog message formatter and writer, supporting unix sockets, UDP
 documentation = "https://docs.rs/syslog"
 keywords = ["syslog", "logs", "logging"]
 license = "MIT"
-name = "syslog"
+name = "syslog_esp32"
 repository = "https://github.com/oeed/rust-syslog-esp32"
 version = "7.0.0"
 

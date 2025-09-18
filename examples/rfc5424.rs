@@ -11,8 +11,8 @@ fn main() {
         pid: 0,
     };
 
-    let mut writer = udp_logger_ipv4(formatter, [127, 0, 0, 1], 514, 256)
-        .expect("could not create udp logger");
+    let mut writer =
+        udp_logger_ipv4(formatter, [127, 0, 0, 1], 514, 256).expect("could not create udp logger");
 
     writer
         .err((1, BTreeMap::new(), "hello world"))
