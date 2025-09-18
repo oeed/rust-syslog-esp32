@@ -3,9 +3,9 @@ use std::fmt::Display;
 use std::io::Write;
 use time;
 
-use errors::*;
-use facility::Facility;
-use Priority;
+use crate::Priority;
+use crate::errors::*;
+use crate::facility::Facility;
 
 #[allow(non_camel_case_types)]
 #[derive(Copy, Clone)]
@@ -185,7 +185,6 @@ mod test {
         assert_eq!(value, "\\]");
     }
 
-    #[test]
     #[test]
     fn test_formatter5424_defaults() {
         let d = Formatter5424::default();

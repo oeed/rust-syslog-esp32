@@ -56,8 +56,8 @@ extern crate time;
 use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::{
-    mpsc::{sync_channel, Receiver, SyncSender, TrySendError},
     Arc, Mutex,
+    mpsc::{Receiver, SyncSender, TrySendError, sync_channel},
 };
 
 use log::{Level, Log, Metadata, Record};
@@ -65,8 +65,6 @@ use log::{Level, Log, Metadata, Record};
 mod errors;
 mod facility;
 mod format;
-#[cfg(test)]
-mod tests;
 
 pub use errors::*;
 pub use facility::Facility;
