@@ -1,10 +1,6 @@
-//! using syslog UDP with the log crate
-extern crate syslog;
-#[macro_use]
-extern crate log;
-
 use log::LevelFilter;
-use syslog::{init_udp_ipv4, Facility};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use syslog::{Facility, init_udp_ipv4};
 
 fn main() {
     init_udp_ipv4(

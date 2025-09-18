@@ -2,7 +2,7 @@
 
 authors = ["oeed"]
 description = "Syslog message formatter and writer, supporting unix sockets, UDP and TCP exporters"
-documentation = "https://docs.rs/syslog"
+edition = "2024"
 keywords = ["syslog", "logs", "logging"]
 license = "MIT"
 name = "syslog_esp32"

@@ -233,13 +233,11 @@ impl Log for BasicLogger {
 /// Create a UDP RFC5424 logger targeting an IPv4 address.
 pub fn udp_logger_ipv4(
     formatter: Formatter5424,
-    ip: [u8; 4],
-    port: u16,
+    addr: SocketAddr,
     queue_capacity: usize,
 ) -> Result<Logger<QueueBackend, Formatter5424>> {
-    let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip)), port);
-    let backend = QueueBackend::new(remote_addr, queue_capacity)
-        .map_err(|e| Error::Initialization(Box::new(e)))?;
+    let backend =
+        QueueBackend::new(addr, queue_capacity).map_err(|e| Error::Initialization(Box::new(e)))?;
     Ok(Logger::new(backend, formatter))
 }
 
@@ -249,8 +247,7 @@ pub fn init_udp_ipv4(
     process: &'static str,
     facility: Facility,
     log_level: log::LevelFilter,
-    ip: [u8; 4],
-    port: u16,
+    addr: SocketAddr,
 ) -> Result<()> {
     let formatter = Formatter5424 {
         facility,
@@ -258,7 +255,7 @@ pub fn init_udp_ipv4(
         process: process.to_string(),
         pid: 0,
     };
-    let logger = udp_logger_ipv4(formatter, ip, port, 256)?;
+    let logger = udp_logger_ipv4(formatter, addr, 256)?;
     log::set_boxed_logger(Box::new(BasicLogger::new(logger)))
         .map_err(|e| Error::Initialization(Box::new(e)))?;
     log::set_max_level(log_level);

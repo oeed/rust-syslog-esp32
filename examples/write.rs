@@ -1,7 +1,6 @@
-extern crate syslog;
-
 use std::collections::BTreeMap;
-use syslog::{udp_logger_ipv4, Facility, Formatter5424, LogFormat};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use syslog::{Facility, Formatter5424, LogFormat, udp_logger_ipv4};
 
 fn main() {
     let formatter = Formatter5424 {
@@ -11,8 +10,12 @@ fn main() {
         pid: 0,
     };
 
-    let mut writer =
-        udp_logger_ipv4(formatter, [127, 0, 0, 1], 514, 256).expect("could not create udp logger");
+    let mut writer = udp_logger_ipv4(
+        formatter,
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 514),
+        256,
+    )
+    .expect("could not create udp logger");
 
     // RFC5424: (message_id, structured_data, message)
     let message_id = 1u32;
