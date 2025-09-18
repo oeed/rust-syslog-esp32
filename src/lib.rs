@@ -53,6 +53,7 @@
 extern crate log;
 extern crate time;
 
+use std::fmt::{self, Arguments};
 use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::{
@@ -60,6 +61,7 @@ use std::sync::{
     mpsc::{Receiver, SyncSender, TrySendError, sync_channel},
 };
 
+use esp_idf_svc::log::EspLogger;
 use log::{Level, Log, Metadata, Record};
 
 mod errors;
@@ -167,6 +169,24 @@ impl Write for QueueBackend {
         Ok(len)
     }
 
+    fn write_fmt(&mut self, args: Arguments) -> io::Result<()> {
+        // Format the entire message once, then send as a single UDP datagram
+        let mut s = String::new();
+        let _ = fmt::write(&mut s, args);
+        let bytes = s.as_bytes();
+        let len = if bytes.len() > 1024 {
+            1024
+        } else {
+            bytes.len()
+        };
+        match self.sender.try_send(bytes[..len].to_vec()) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {}
+            Err(TrySendError::Disconnected(_)) => {}
+        }
+        Ok(())
+    }
+
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
@@ -186,12 +206,15 @@ fn spawn_udp_worker(remote_addr: SocketAddr, rx: Receiver<Vec<u8>>) -> io::Resul
 
 pub struct BasicLogger {
     logger: Arc<Mutex<Logger<QueueBackend, Formatter5424>>>,
+    esp_logger: Arc<Mutex<EspLogger>>,
 }
 
 impl BasicLogger {
     pub fn new(logger: Logger<QueueBackend, Formatter5424>) -> BasicLogger {
+        let esp_logger = EspLogger::new();
         BasicLogger {
             logger: Arc::new(Mutex::new(logger)),
+            esp_logger: Arc::new(Mutex::new(esp_logger)),
         }
     }
 }
@@ -206,6 +229,10 @@ impl Log for BasicLogger {
         if !self.enabled(record.metadata()) {
             return;
         }
+        if let Ok(esp_logger) = self.esp_logger.try_lock() {
+            esp_logger.log(record);
+        }
+
         let message = format!("{}", record.args());
         if let Ok(mut logger) = self.logger.try_lock() {
             // RFC5424 requires (message_id, structured_data, message)
