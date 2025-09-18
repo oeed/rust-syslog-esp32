@@ -1,68 +1,64 @@
-//! Syslog
+//! Syslog for ESP32 (UDP, RFC 5424)
 //!
-//! This crate provides facilities to send log messages via syslog.
-//! It supports Unix sockets for local syslog, UDP and TCP for remote servers.
+//! This crate provides a UDP-only, non-blocking producer logger for ESP32.
+//! Messages are formatted in RFC 5424 and delivered via a background worker thread.
 //!
-//! Messages can be passed directly without modification, or in RFC 3164 or RFC 5424 format
+//! Use with the `log` crate via `init_udp_ipv4`.
 //!
-//! The code is available on [Github](https://github.com/Geal/rust-syslog)
-//!
-//! # Example
+//! Example: initialize global logger and use `log` macros
 //!
 //! ```rust
-//! use syslog::{Facility, Formatter3164};
+//! use log::LevelFilter;
+//! use syslog::{init_udp_ipv4, Facility};
 //!
-//! let formatter = Formatter3164 {
-//!     facility: Facility::LOG_USER,
-//!     hostname: None,
-//!     process: "myprogram".into(),
-//!     pid: 0,
-//! };
+//! fn main() {
+//!     // Send RFC 5424 logs over UDP to 192.168.1.10:514
+//!     let _ = init_udp_ipv4(
+//!         Some("esp32"),
+//!         "myprogram",
+//!         Facility::LOG_USER,
+//!         LevelFilter::Info,
+//!         [192, 168, 1, 10],
+//!         514,
+//!     );
 //!
-//! match syslog::unix(formatter) {
-//!     Err(e) => println!("impossible to connect to syslog: {:?}", e),
-//!     Ok(mut writer) => {
-//!         writer.err("hello world").expect("could not write error message");
-//!     }
+//!     log::info!("hello world");
 //! }
 //! ```
 //!
-//! It can be used directly with the log crate as follows:
+//! Example: create a dedicated UDP logger and write RFC 5424 directly
 //!
 //! ```rust
-//! extern crate log;
+//! use std::collections::BTreeMap;
+//! use syslog::{udp_logger_ipv4, Facility, Formatter5424, LogFormat};
 //!
-//! use syslog::{Facility, Formatter3164, BasicLogger};
-//! use log::{SetLoggerError, LevelFilter, info};
+//! fn main() {
+//!     let formatter = Formatter5424 {
+//!         facility: Facility::LOG_USER,
+//!         hostname: Some("esp32".to_string()),
+//!         process: "myprogram".to_string(),
+//!         pid: 0,
+//!     };
 //!
-//! let formatter = Formatter3164 {
-//!     facility: Facility::LOG_USER,
-//!     hostname: None,
-//!     process: "myprogram".into(),
-//!     pid: 0,
-//! };
+//!     // Create a UDP logger targeting 127.0.0.1:514
+//!     let mut logger = udp_logger_ipv4(formatter, [127, 0, 0, 1], 514, 256)
+//!         .expect("create udp logger");
 //!
-//! let logger = match syslog::unix(formatter) {
-//!     Err(e) => { println!("impossible to connect to syslog: {:?}", e); return; },
-//!     Ok(logger) => logger,
-//! };
-//! log::set_boxed_logger(Box::new(BasicLogger::new(logger)))
-//!         .map(|()| log::set_max_level(LevelFilter::Info));
-//!
-//! info!("hello world");
+//!     // RFC 5424 message: (message_id, structured_data, message)
+//!     let message_id = 1u32;
+//!     let data: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+//!     let _ = logger.err((message_id, data, "hello world"));
+//! }
 //! ```
 extern crate log;
 extern crate time;
 
-use std::env;
-use std::fmt::{self, Arguments};
-use std::io::{self, BufWriter, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
-#[cfg(unix)]
-use std::os::unix::net::{UnixDatagram, UnixStream};
-use std::path::Path;
-use std::process;
-use std::sync::{Arc, Mutex};
+use std::io::{self, Write};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::sync::{
+    mpsc::{sync_channel, Receiver, SyncSender, TrySendError},
+    Arc, Mutex,
+};
 
 use log::{Level, Log, Metadata, Record};
 
@@ -75,11 +71,9 @@ mod tests;
 pub use errors::*;
 pub use facility::Facility;
 pub use format::Severity;
-pub use format::{Formatter3164, Formatter5424, LogFormat};
+pub use format::{Formatter5424, LogFormat};
 
 pub type Priority = u8;
-
-const UNIX_SOCK_PATHS: [&str; 3] = ["/dev/log", "/var/run/syslog", "/var/run/log"];
 
 /// Main logging structure
 pub struct Logger<Backend: Write, Formatter> {
@@ -149,191 +143,55 @@ impl<W: Write, F> Logger<W, F> {
     }
 }
 
-pub enum LoggerBackend {
-    /// Unix socket, temp file path, log file path
-    #[cfg(unix)]
-    Unix(UnixDatagram),
-    #[cfg(not(unix))]
-    Unix(()),
-    #[cfg(unix)]
-    UnixStream(BufWriter<UnixStream>),
-    #[cfg(not(unix))]
-    UnixStream(()),
-    Udp(UdpSocket, SocketAddr),
-    Tcp(BufWriter<TcpStream>),
+/// Non-blocking queue backend for UDP worker
+pub struct QueueBackend {
+    sender: SyncSender<Vec<u8>>,
 }
 
-impl Write for LoggerBackend {
-    /// Sends a message directly, without any formatting
-    fn write(&mut self, message: &[u8]) -> io::Result<usize> {
-        match *self {
-            #[cfg(unix)]
-            LoggerBackend::Unix(ref dgram) => dgram.send(message),
-            #[cfg(unix)]
-            LoggerBackend::UnixStream(ref mut socket) => {
-                let null = [0; 1];
-                socket
-                    .write(message)
-                    .and_then(|sz| socket.write(&null).map(|_| sz))
-                    .and_then(|sz| socket.flush().map(|_| sz))
-            }
-            LoggerBackend::Udp(ref socket, ref addr) => socket.send_to(message, addr),
-            LoggerBackend::Tcp(ref mut socket) => socket
-                .write(message)
-                .and_then(|sz| socket.flush().map(|_| sz)),
-            #[cfg(not(unix))]
-            LoggerBackend::Unix(_) | LoggerBackend::UnixStream(_) => {
-                Err(io::Error::new(io::ErrorKind::Other, "unsupported platform"))
-            }
-        }
+impl QueueBackend {
+    fn new(remote_addr: SocketAddr, queue_capacity: usize) -> io::Result<QueueBackend> {
+        let (tx, rx): (SyncSender<Vec<u8>>, Receiver<Vec<u8>>) = sync_channel(queue_capacity);
+        spawn_udp_worker(remote_addr, rx)?;
+        Ok(QueueBackend { sender: tx })
     }
+}
 
-    fn write_fmt(&mut self, args: Arguments) -> io::Result<()> {
-        match *self {
-            #[cfg(unix)]
-            LoggerBackend::Unix(ref dgram) => {
-                let message = fmt::format(args);
-                dgram.send(message.as_bytes()).map(|_| ())
-            }
-            #[cfg(unix)]
-            LoggerBackend::UnixStream(ref mut socket) => {
-                let null = [0; 1];
-                socket
-                    .write_fmt(args)
-                    .and_then(|_| socket.write(&null).map(|_| ()))
-                    .and_then(|sz| socket.flush().map(|_| sz))
-            }
-            LoggerBackend::Udp(ref socket, ref addr) => {
-                let message = fmt::format(args);
-                socket.send_to(message.as_bytes(), addr).map(|_| ())
-            }
-            LoggerBackend::Tcp(ref mut socket) => socket
-                .write_fmt(args)
-                .and_then(|sz| socket.flush().map(|_| sz)),
-            #[cfg(not(unix))]
-            LoggerBackend::Unix(_) | LoggerBackend::UnixStream(_) => {
-                Err(io::Error::new(io::ErrorKind::Other, "unsupported platform"))
-            }
+impl Write for QueueBackend {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        // Trim to 1024 bytes per requirement
+        let len = if buf.len() > 1024 { 1024 } else { buf.len() };
+        let slice = &buf[..len];
+        match self.sender.try_send(slice.to_vec()) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {}
+            Err(TrySendError::Disconnected(_)) => {}
         }
+        Ok(len)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        match *self {
-            #[cfg(unix)]
-            LoggerBackend::Unix(_) => Ok(()),
-            #[cfg(unix)]
-            LoggerBackend::UnixStream(ref mut socket) => socket.flush(),
-            LoggerBackend::Udp(_, _) => Ok(()),
-            LoggerBackend::Tcp(ref mut socket) => socket.flush(),
-            #[cfg(not(unix))]
-            LoggerBackend::Unix(_) | LoggerBackend::UnixStream(_) => {
-                Err(io::Error::new(io::ErrorKind::Other, "unsupported platform"))
-            }
-        }
+        Ok(())
     }
 }
 
-/// Returns a Logger using unix socket to target local syslog ( using /dev/log or /var/run/syslog)
-#[cfg(unix)]
-pub fn unix<F: Clone>(formatter: F) -> Result<Logger<LoggerBackend, F>> {
-    UNIX_SOCK_PATHS
-        .iter()
-        .find_map(|path| {
-            unix_connect(formatter.clone(), *path).map_or_else(
-                |e| {
-                    if let Error::Io(ref io_err) = e {
-                        if io_err.kind() == io::ErrorKind::NotFound {
-                            None // not considered an error, try the next path
-                        } else {
-                            Some(Err(e))
-                        }
-                    } else {
-                        Some(Err(e))
-                    }
-                },
-                |logger| Some(Ok(logger)),
-            )
-        })
-        .transpose()
-        .map_err(|e| Error::Initialization(Box::new(e)))?
-        .ok_or_else(|| Error::Initialization("unix socket paths not found".into()))
-}
-
-#[cfg(not(unix))]
-pub fn unix<F: Clone>(_formatter: F) -> Result<Logger<LoggerBackend, F>> {
-    Err(ErrorKind::UnsupportedPlatform)?
-}
-
-/// Returns a Logger using unix socket to target local syslog at user provided path
-#[cfg(unix)]
-pub fn unix_custom<P: AsRef<Path>, F>(formatter: F, path: P) -> Result<Logger<LoggerBackend, F>> {
-    unix_connect(formatter, path).map_err(|e| Error::Initialization(Box::new(e)))
-}
-
-#[cfg(not(unix))]
-pub fn unix_custom<P: AsRef<Path>, F>(_formatter: F, _path: P) -> Result<Logger<LoggerBackend, F>> {
-    Err(ErrorKind::UnsupportedPlatform)?
-}
-
-#[cfg(unix)]
-fn unix_connect<P: AsRef<Path>, F>(formatter: F, path: P) -> Result<Logger<LoggerBackend, F>> {
-    let sock = UnixDatagram::unbound()?;
-    match sock.connect(&path) {
-        Ok(()) => Ok(Logger {
-            formatter,
-            backend: LoggerBackend::Unix(sock),
-        }),
-        Err(ref e) if e.raw_os_error() == Some(libc::EPROTOTYPE) => {
-            let sock = UnixStream::connect(path)?;
-            Ok(Logger {
-                formatter,
-                backend: LoggerBackend::UnixStream(BufWriter::new(sock)),
-            })
+fn spawn_udp_worker(remote_addr: SocketAddr, rx: Receiver<Vec<u8>>) -> io::Result<()> {
+    // Bind ephemeral local address
+    let socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))?;
+    std::thread::spawn(move || {
+        // Dedicated thread: may block on recv/send. All errors are ignored.
+        while let Ok(msg) = rx.recv() {
+            let _ = socket.send_to(&msg, remote_addr);
         }
-        Err(e) => Err(e.into()),
-    }
-}
-
-/// returns a UDP logger connecting `local` and `server`
-pub fn udp<T: ToSocketAddrs, U: ToSocketAddrs, F>(
-    formatter: F,
-    local: T,
-    server: U,
-) -> Result<Logger<LoggerBackend, F>> {
-    server
-        .to_socket_addrs()
-        .map_err(|e| Error::Initialization(Box::new(e)))
-        .and_then(|mut server_addr_opt| {
-            server_addr_opt
-                .next()
-                .ok_or_else(|| Error::Initialization("no server address".into()))
-        })
-        .and_then(|server_addr| {
-            UdpSocket::bind(local)
-                .map_err(|e| Error::Initialization(Box::new(e)))
-                .map(|socket| Logger {
-                    formatter,
-                    backend: LoggerBackend::Udp(socket, server_addr),
-                })
-        })
-}
-
-/// returns a TCP logger connecting `local` and `server`
-pub fn tcp<T: ToSocketAddrs, F>(formatter: F, server: T) -> Result<Logger<LoggerBackend, F>> {
-    TcpStream::connect(server)
-        .map_err(|e| Error::Initialization(e.into()))
-        .map(|socket| Logger {
-            formatter,
-            backend: LoggerBackend::Tcp(BufWriter::new(socket)),
-        })
+    });
+    Ok(())
 }
 
 pub struct BasicLogger {
-    logger: Arc<Mutex<Logger<LoggerBackend, Formatter3164>>>,
+    logger: Arc<Mutex<Logger<QueueBackend, Formatter5424>>>,
 }
 
 impl BasicLogger {
-    pub fn new(logger: Logger<LoggerBackend, Formatter3164>) -> BasicLogger {
+    pub fn new(logger: Logger<QueueBackend, Formatter5424>) -> BasicLogger {
         BasicLogger {
             logger: Arc::new(Mutex::new(logger)),
         }
@@ -347,186 +205,62 @@ impl Log for BasicLogger {
     }
 
     fn log(&self, record: &Record) {
-        if self.enabled(record.metadata()) {
-            //FIXME: temporary patch to compile
-            let message = format!("{}", record.args());
-            let mut logger = self.logger.lock().unwrap();
-            match record.level() {
-                Level::Error => logger.err(message),
-                Level::Warn => logger.warning(message),
-                Level::Info => logger.info(message),
-                Level::Debug => logger.debug(message),
-                Level::Trace => logger.debug(message),
-            };
+        if !self.enabled(record.metadata()) {
+            return;
         }
+        let message = format!("{}", record.args());
+        if let Ok(mut logger) = self.logger.try_lock() {
+            // RFC5424 requires (message_id, structured_data, message)
+            let message_id = 1u32;
+            let data = std::collections::BTreeMap::new();
+            let _ = match record.level() {
+                Level::Error => logger.err((message_id, data.clone(), message)),
+                Level::Warn => logger.warning((message_id, data.clone(), message)),
+                Level::Info => logger.info((message_id, data.clone(), message)),
+                Level::Debug => logger.debug((message_id, data.clone(), message)),
+                Level::Trace => logger.debug((message_id, data.clone(), message)),
+            };
+        } // else: drop on contention
     }
 
     fn flush(&self) {
-        let _ = self.logger.lock().unwrap().backend.flush();
+        if let Ok(mut logger) = self.logger.try_lock() {
+            let _ = logger.backend.flush();
+        }
     }
 }
 
-/// Unix socket Logger init function compatible with log crate
-#[cfg(unix)]
-pub fn init_unix(facility: Facility, log_level: log::LevelFilter) -> Result<()> {
-    let (process, pid) = get_process_info()?;
-    let formatter = Formatter3164 {
-        facility,
-        hostname: None,
-        process,
-        pid,
-    };
-    unix(formatter).and_then(|logger| {
-        log::set_boxed_logger(Box::new(BasicLogger::new(logger)))
-            .map_err(|e| Error::Initialization(Box::new(e)))
-    })?;
-
-    log::set_max_level(log_level);
-    Ok(())
-}
-
-#[cfg(not(unix))]
-pub fn init_unix(_facility: Facility, _log_level: log::LevelFilter) -> Result<()> {
-    Err(ErrorKind::UnsupportedPlatform)?
-}
-
-/// Unix socket Logger init function compatible with log crate and user provided socket path
-#[cfg(unix)]
-pub fn init_unix_custom<P: AsRef<Path>>(
-    facility: Facility,
-    log_level: log::LevelFilter,
-    path: P,
-) -> Result<()> {
-    let (process, pid) = get_process_info()?;
-    let formatter = Formatter3164 {
-        facility,
-        hostname: None,
-        process,
-        pid,
-    };
-    unix_custom(formatter, path).and_then(|logger| {
-        log::set_boxed_logger(Box::new(BasicLogger::new(logger)))
-            .map_err(|e| Error::Initialization(Box::new(e)))
-    })?;
-
-    log::set_max_level(log_level);
-    Ok(())
-}
-
-#[cfg(not(unix))]
-pub fn init_unix_custom<P: AsRef<Path>>(
-    _facility: Facility,
-    _log_level: log::LevelFilter,
-    _path: P,
-) -> Result<()> {
-    Err(ErrorKind::UnsupportedPlatform)?
-}
-
-/// UDP Logger init function compatible with log crate
-pub fn init_udp<T: ToSocketAddrs>(
-    local: T,
-    server: T,
-    hostname: String,
-    facility: Facility,
-    log_level: log::LevelFilter,
-) -> Result<()> {
-    let (process, pid) = get_process_info()?;
-    let formatter = Formatter3164 {
-        facility,
-        hostname: Some(hostname),
-        process,
-        pid,
-    };
-    udp(formatter, local, server).and_then(|logger| {
-        log::set_boxed_logger(Box::new(BasicLogger::new(logger)))
-            .map_err(|e| Error::Initialization(Box::new(e)))
-    })?;
-
-    log::set_max_level(log_level);
-    Ok(())
-}
-
-/// TCP Logger init function compatible with log crate
-pub fn init_tcp<T: ToSocketAddrs>(
-    server: T,
-    hostname: String,
-    facility: Facility,
-    log_level: log::LevelFilter,
-) -> Result<()> {
-    let (process, pid) = get_process_info()?;
-    let formatter = Formatter3164 {
-        facility,
-        hostname: Some(hostname),
-        process,
-        pid,
-    };
-
-    tcp(formatter, server).and_then(|logger| {
-        log::set_boxed_logger(Box::new(BasicLogger::new(logger)))
-            .map_err(|e| Error::Initialization(Box::new(e)))
-    })?;
-
-    log::set_max_level(log_level);
-    Ok(())
-}
-
-/// Initializes logging subsystem for log crate
-///
-/// This tries to connect to syslog by following ways:
-///
-/// 1. Unix sockets /dev/log and /var/run/syslog (in this order)
-/// 2. Tcp connection to 127.0.0.1:601
-/// 3. Udp connection to 127.0.0.1:514
-///
-/// Note the last option usually (almost) never fails in this method. So
-/// this method doesn't return error even if there is no syslog.
-///
-/// If `application_name` is `None` name is derived from executable name
-pub fn init(
-    facility: Facility,
-    log_level: log::LevelFilter,
-    application_name: Option<&str>,
-) -> Result<()> {
-    let (process_name, pid) = get_process_info()?;
-    let process = application_name.map(From::from).unwrap_or(process_name);
-    let mut formatter = Formatter3164 {
-        facility,
-        hostname: None,
-        process,
-        pid,
-    };
-
-    let backend = if let Ok(logger) = unix(formatter.clone()) {
-        logger.backend
-    } else {
-        formatter.hostname = get_hostname().ok();
-        if let Ok(tcp_stream) = TcpStream::connect(("127.0.0.1", 601)) {
-            LoggerBackend::Tcp(BufWriter::new(tcp_stream))
-        } else {
-            let udp_addr = "127.0.0.1:514".parse().unwrap();
-            let udp_stream = UdpSocket::bind(("127.0.0.1", 0))?;
-            LoggerBackend::Udp(udp_stream, udp_addr)
-        }
-    };
-    log::set_boxed_logger(Box::new(BasicLogger::new(Logger { formatter, backend })))
+/// Create a UDP RFC5424 logger targeting an IPv4 address.
+pub fn udp_logger_ipv4(
+    formatter: Formatter5424,
+    ip: [u8; 4],
+    port: u16,
+    queue_capacity: usize,
+) -> Result<Logger<QueueBackend, Formatter5424>> {
+    let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip)), port);
+    let backend = QueueBackend::new(remote_addr, queue_capacity)
         .map_err(|e| Error::Initialization(Box::new(e)))?;
+    Ok(Logger::new(backend, formatter))
+}
 
+/// Initialize global logger for `log` crate, UDP IPv4 only.
+pub fn init_udp_ipv4(
+    hostname: Option<&'static str>,
+    process: &'static str,
+    facility: Facility,
+    log_level: log::LevelFilter,
+    ip: [u8; 4],
+    port: u16,
+) -> Result<()> {
+    let formatter = Formatter5424 {
+        facility,
+        hostname: hostname.map(|s| s.to_string()),
+        process: process.to_string(),
+        pid: 0,
+    };
+    let logger = udp_logger_ipv4(formatter, ip, port, 256)?;
+    log::set_boxed_logger(Box::new(BasicLogger::new(logger)))
+        .map_err(|e| Error::Initialization(Box::new(e)))?;
     log::set_max_level(log_level);
     Ok(())
-}
-
-fn get_process_info() -> Result<(String, u32)> {
-    env::current_exe()
-        .map_err(|e| Error::Initialization(Box::new(e)))
-        .and_then(|path| {
-            path.file_name()
-                .and_then(|os_name| os_name.to_str())
-                .map(|name| name.to_string())
-                .ok_or_else(|| Error::Initialization("process name not found".into()))
-        })
-        .map(|name| (name, process::id()))
-}
-
-fn get_hostname() -> Result<String> {
-    Ok(hostname::get()?.to_string_lossy().to_string())
 }

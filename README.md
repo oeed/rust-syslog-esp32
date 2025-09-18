@@ -1,77 +1,52 @@
-# Sending to Syslog in Rust
+## Syslog for ESP32 (UDP, RFC5424)
 
-[![Build Status](https://github.com/Geal/rust-syslog/actions/workflows/rust.yml/badge.svg)](https://github.com/Geal/rust-syslog/actions/workflows/rust.yml)
-![Codecov](https://img.shields.io/codecov/c/github/geal/rust-syslog)
-[![crates.io Version](https://img.shields.io/crates/v/syslog.svg)](https://crates.io/crates/syslog)
+This fork targets ESP32 only. It sends RFC 5424-formatted messages over UDP using a background worker thread. The producer side never blocks; messages are dropped if the queue is full or if any error occurs.
 
-A small library to send syslog messages to unix sockets, TCP or UDP.
-
-## Installation
-
-syslog is available on [crates.io](https://crates.io/crates/syslog) and can be included in your Cargo enabled project like this:
+### Install
 
 ```toml
 [dependencies]
-syslog = "^6.0"
-```
+syslog = { path = "." }
+log = "0.4"
+``
 
-## documentation
-
-Reference documentation is available [here](https://docs.rs/syslog).
-
-## Example
+### Use with the `log` crate
 
 ```rust
-extern crate syslog;
-
-use syslog::{Facility, Formatter3164};
+use log::LevelFilter;
+use syslog::{init_udp_ipv4, Facility};
 
 fn main() {
-  let formatter = Formatter3164 {
-    facility: Facility::LOG_USER,
-    hostname: None,
-    process: "myprogram".into(),
-    pid: 42,
-  };
+    let _ = init_udp_ipv4(
+        Some("esp32"),
+        "myprogram",
+        Facility::LOG_USER,
+        LevelFilter::Info,
+        [192, 168, 1, 10],
+        514,
+    );
 
-  match syslog::unix(formatter) {
-    Err(e)         => println!("impossible to connect to syslog: {:?}", e),
-    Ok(mut writer) => {
-      writer.err("hello world").expect("could not write error message");
-    }
-  }
+    log::info!("hello world");
 }
 ```
 
-The struct `syslog::Logger` implements `Log` from the `log` crate, so it can be used as backend for other logging systems:
+### Direct RFC5424 usage
 
 ```rust
-extern crate syslog;
-#[macro_use]
-extern crate log;
-
-use syslog::{Facility, Formatter3164, BasicLogger};
-use log::{SetLoggerError, LevelFilter};
+use std::collections::BTreeMap;
+use syslog::{udp_logger_ipv4, Facility, Formatter5424, LogFormat};
 
 fn main() {
-    let formatter = Formatter3164 {
+    let formatter = Formatter5424 {
         facility: Facility::LOG_USER,
-        hostname: None,
-        process: "myprogram".into(),
+        hostname: Some("esp32".to_string()),
+        process: "myprogram".to_string(),
         pid: 0,
     };
 
-    let logger = syslog::unix(formatter).expect("could not connect to syslog");
-    log::set_boxed_logger(Box::new(BasicLogger::new(logger)))
-            .map(|()| log::set_max_level(LevelFilter::Info));
-
-    info!("hello world");
+    let mut logger = udp_logger_ipv4(formatter, [127, 0, 0, 1], 514, 256).unwrap();
+    let message_id = 1u32;
+    let data: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    let _ = logger.err((message_id, data, "hello world"));
 }
-
 ```
-
-There are 3 functions to create loggers:
-
-* the `unix` function sends to the local syslog through a Unix socket: `syslog::unix(formatter)`
-* the `tcp` function takes an address for a remote TCP syslog server: `tcp(formatter, "127.0.0.1:4242")`
-* the `udp` function takes an address for a local port, and the address remote UDP syslog server: `udp(formatter, "127.0.0.1:1234", "127.0.0.1:4242")`

@@ -1,24 +1,21 @@
 extern crate syslog;
 
-use syslog::{Facility, Formatter3164};
+use std::collections::BTreeMap;
+use syslog::{udp_logger_ipv4, Facility, Formatter5424, LogFormat};
 
 fn main() {
-    let formatter = Formatter3164 {
+    let formatter = Formatter5424 {
         facility: Facility::LOG_USER,
-        hostname: None,
-        process: "myprogram".into(),
+        hostname: Some("esp32".to_string()),
+        process: "myprogram".to_string(),
         pid: 0,
     };
 
-    match syslog::unix(formatter) {
-        Err(e) => println!("impossible to connect to syslog: {:?}", e),
-        Ok(mut writer) => {
-            writer
-                .err("hello world")
-                .expect("could not write error message");
-            writer
-                .err("hello all".to_string())
-                .expect("could not write error message");
-        }
-    }
+    let mut writer =
+        udp_logger_ipv4(formatter, [127, 0, 0, 1], 514, 256).expect("could not create udp logger");
+
+    // RFC5424: (message_id, structured_data, message)
+    let message_id = 1u32;
+    let data: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    let _ = writer.err((message_id, data, "hello world"));
 }
