@@ -212,6 +212,9 @@ pub struct BasicLogger {
 impl BasicLogger {
     pub fn new(logger: Logger<QueueBackend, Formatter5424>) -> BasicLogger {
         let esp_logger = EspLogger::new();
+        esp_logger
+            .set_target_level("main", log::LevelFilter::Debug)
+            .ok();
         BasicLogger {
             logger: Arc::new(Mutex::new(logger)),
             esp_logger: Arc::new(Mutex::new(esp_logger)),
