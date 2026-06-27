@@ -7,7 +7,7 @@ keywords = ["syslog", "logs", "logging"]
 license = "MIT"
 name = "syslog_esp32"
 repository = "https://github.com/oeed/rust-syslog-esp32"
-version = "8.0.0"
+version = "8.0.1"
 
 [dependencies]
 esp-idf-svc = "0.51"

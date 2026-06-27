@@ -1,10 +1,12 @@
 //! On-flash, reboot-persistent spill buffer for log records that could not be delivered.
 //!
 //! Records are length-framed with a CRC32 so a write torn by power loss is detected and
-//! discarded on the next read. The store keeps at most `max_records` entries, dropping the
-//! oldest in batches once full. It is written to a filesystem path the caller mounts
-//! (a FAT/wear-levelled partition on the ESP32); all durability comes from that filesystem
-//! plus the atomic temp-file rename used by [`SpillStore::replace_with`].
+//! discarded on the next read. The store is bounded by both a record count and a total byte
+//! size ([`MAX_SPILL_BYTES`]) so it can always be loaded into RAM to drain it without
+//! exhausting the (small) heap — the partition may be much larger than this cap. It is
+//! written to a filesystem path the caller mounts (a FAT/wear-levelled partition on the
+//! ESP32); durability comes from that filesystem plus the atomic temp-file rename used by
+//! [`SpillStore::replace_with`].
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -22,6 +24,11 @@ const CRC_LEN: usize = 4;
 /// Upper bound on a single message, mirroring the original UDP transport's 1 KiB cap.
 const MAX_MSG_LEN: usize = 1024;
 
+/// Hard cap on the total spilled bytes kept on flash. The whole buffer is read into RAM to
+/// drain it, so this MUST stay well under the device's free heap — it bounds memory, not the
+/// partition (which can be larger). At ~24 KiB this holds a few hundred typical log lines.
+const MAX_SPILL_BYTES: usize = 24 * 1024;
+
 /// A single buffered log event.
 pub struct Record {
     /// Syslog numeric severity (0..=7).
@@ -37,6 +44,11 @@ pub struct Record {
 }
 
 impl Record {
+    /// Number of bytes this record occupies on disk once framed.
+    fn encoded_len(&self) -> usize {
+        HEADER_LEN + self.msg.len().min(MAX_MSG_LEN) + CRC_LEN
+    }
+
     fn to_bytes(&self) -> Vec<u8> {
         let msg_len = self.msg.len().min(MAX_MSG_LEN);
         let msg = &self.msg[..msg_len];
@@ -97,45 +109,70 @@ impl Record {
     }
 }
 
+fn total_bytes(records: &[Record]) -> usize {
+    records.iter().map(Record::encoded_len).sum()
+}
+
 pub struct SpillStore {
     path: PathBuf,
     tmp_path: PathBuf,
     max_records: usize,
     count: usize,
+    bytes: usize,
 }
 
 impl SpillStore {
-    /// Open (or lazily create) the spill file at `path`. Scans any existing contents so
-    /// records recovered from a previous boot are counted and eligible for draining.
+    /// Open the spill file at `path`, recovering any records left by a previous boot.
+    ///
+    /// If the existing file is unreadable, or larger than [`MAX_SPILL_BYTES`] (which can
+    /// happen after a crash, a power-loss, or an older build with a different cap), it is
+    /// discarded rather than loaded — loading it could exhaust the heap and crash on boot.
     pub fn open(path: &str, max_records: usize) -> SpillStore {
         let path = PathBuf::from(path);
         let tmp_path = path.with_extension("tmp");
         // A temp file left behind by a crash mid-rewrite is stale; discard it.
         let _ = std::fs::remove_file(&tmp_path);
-        let count = read_records(&path).len();
-        SpillStore {
+
+        let mut store = SpillStore {
             path,
             tmp_path,
             max_records,
-            count,
+            count: 0,
+            bytes: 0,
+        };
+
+        let records = read_records(&store.path);
+        if records.is_empty() {
+            // Empty, unreadable, or over-cap (read_records refuses oversized files): start
+            // from a clean slate so a corrupt/oversized buffer can't wedge the device.
+            store.clear();
+        } else {
+            // Rewrite exactly the records we could parse (dropping any torn tail) and set
+            // the counters from them.
+            store.replace_with(&records);
         }
+        store
     }
 
     pub fn is_empty(&self) -> bool {
         self.count == 0
     }
 
-    /// Append a record, dropping the oldest batch first if the store is at capacity.
+    /// Append a record, evicting the oldest first so the store stays within both the record
+    /// and byte caps.
     pub fn append(&mut self, record: &Record) {
-        if self.max_records > 0 && self.count >= self.max_records {
-            self.trim_oldest();
+        let len = record.encoded_len();
+        let over_count = self.max_records > 0 && self.count >= self.max_records;
+        let over_bytes = self.bytes + len > MAX_SPILL_BYTES;
+        if over_count || over_bytes {
+            self.trim_to_fit(len);
         }
-        let bytes = record.to_bytes();
         match OpenOptions::new().create(true).append(true).open(&self.path) {
             Ok(mut file) => {
-                if file.write_all(&bytes).is_ok() {
+                if file.write_all(&record.to_bytes()).is_ok() {
                     let _ = file.flush();
                     self.count += 1;
+                    self.bytes += len;
                 }
             }
             Err(_) => {
@@ -162,6 +199,7 @@ impl SpillStore {
             drop(file);
             if ok && std::fs::rename(&self.tmp_path, &self.path).is_ok() {
                 self.count = records.len();
+                self.bytes = total_bytes(records);
                 return;
             }
         }
@@ -171,32 +209,65 @@ impl SpillStore {
     pub fn clear(&mut self) {
         if std::fs::remove_file(&self.path).is_ok() || !self.path.exists() {
             self.count = 0;
+            self.bytes = 0;
             return;
         }
         // Removal failed but the file is still present: truncate it to empty so its
         // already-delivered records can't be re-drained and duplicated on the server.
         if File::create(&self.path).is_ok() {
             self.count = 0;
+            self.bytes = 0;
         }
     }
 
-    fn trim_oldest(&mut self) {
+    /// Drop the oldest records until `incoming` more bytes fit under both caps.
+    fn trim_to_fit(&mut self, incoming: usize) {
         let mut records = self.read_all();
-        let drop = (self.max_records / 10).max(1).min(records.len());
-        records.drain(0..drop);
+        let mut total = total_bytes(&records);
+        let byte_limit = MAX_SPILL_BYTES.saturating_sub(incoming);
+        let count_limit = if self.max_records > 0 {
+            self.max_records.saturating_sub(1)
+        } else {
+            usize::MAX
+        };
+
+        let mut drop_n = 0;
+        while drop_n < records.len() && (records.len() - drop_n > count_limit || total > byte_limit) {
+            total -= records[drop_n].encoded_len();
+            drop_n += 1;
+        }
+        records.drain(0..drop_n);
         self.replace_with(&records);
     }
 }
 
 fn read_records(path: &PathBuf) -> Vec<Record> {
-    let mut data = Vec::new();
-    match File::open(path) {
-        Ok(mut file) => {
-            if file.read_to_end(&mut data).is_err() {
-                return Vec::new();
-            }
-        }
+    let mut file = match File::open(path) {
+        Ok(file) => file,
         Err(_) => return Vec::new(),
+    };
+
+    // Read with a fixed buffer into a single, bounded allocation — never `read_to_end`, which
+    // reserves the file's reported size up front and aborts the process on a small heap if the
+    // file (or its metadata) is large. `try_reserve` degrades to "nothing recovered" instead.
+    let mut data: Vec<u8> = Vec::new();
+    if data.try_reserve_exact(MAX_SPILL_BYTES).is_err() {
+        return Vec::new();
+    }
+    let mut chunk = [0u8; 512];
+    loop {
+        match file.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                if data.len() + n > MAX_SPILL_BYTES {
+                    // Oversized: refuse to load it. `open` treats an empty result for a
+                    // non-empty file as a signal to reset, avoiding an out-of-memory abort.
+                    return Vec::new();
+                }
+                data.extend_from_slice(&chunk[..n]);
+            }
+            Err(_) => return Vec::new(),
+        }
     }
 
     let mut records = Vec::new();
@@ -246,6 +317,7 @@ mod test {
         let bytes = record("hello", 1_700_000_000_000_000).to_bytes();
         let (parsed, used) = Record::parse(&bytes).expect("parse");
         assert_eq!(used, bytes.len());
+        assert_eq!(used, record("hello", 0).encoded_len());
         assert_eq!(parsed.msg, b"hello");
         assert_eq!(parsed.wall_us, 1_700_000_000_000_000);
         assert_eq!(parsed.boot_epoch, 0xDEAD_BEEF);
