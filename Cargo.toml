@@ -1,13 +1,13 @@
 [package]
 
 authors = ["oeed"]
-description = "Syslog message formatter and writer, supporting unix sockets, UDP and TCP exporters"
+description = "RFC 5424 syslog over TCP for ESP32, with a reboot-persistent spill buffer for offline delivery"
 edition = "2024"
 keywords = ["syslog", "logs", "logging"]
 license = "MIT"
 name = "syslog_esp32"
 repository = "https://github.com/oeed/rust-syslog-esp32"
-version = "7.0.0"
+version = "8.0.0"
 
 [dependencies]
 esp-idf-svc = "0.51"

@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 use std::fmt::Display;
 use std::io::Write;
-use time;
+
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 use crate::Priority;
 use crate::errors::*;
@@ -20,40 +22,34 @@ pub enum Severity {
     LOG_DEBUG,
 }
 
+impl Severity {
+    /// Reconstruct a severity from its syslog numeric value (0..=7). Out-of-range
+    /// values fall back to `LOG_DEBUG`.
+    pub fn from_u8(value: u8) -> Severity {
+        match value {
+            0 => Severity::LOG_EMERG,
+            1 => Severity::LOG_ALERT,
+            2 => Severity::LOG_CRIT,
+            3 => Severity::LOG_ERR,
+            4 => Severity::LOG_WARNING,
+            5 => Severity::LOG_NOTICE,
+            6 => Severity::LOG_INFO,
+            _ => Severity::LOG_DEBUG,
+        }
+    }
+}
+
 pub trait LogFormat<T> {
-    fn format<W: Write>(&self, w: &mut W, severity: Severity, message: T) -> Result<()>;
-
-    fn emerg<W: Write>(&mut self, w: &mut W, message: T) -> Result<()> {
-        self.format(w, Severity::LOG_EMERG, message)
-    }
-
-    fn alert<W: Write>(&mut self, w: &mut W, message: T) -> Result<()> {
-        self.format(w, Severity::LOG_ALERT, message)
-    }
-
-    fn crit<W: Write>(&mut self, w: &mut W, message: T) -> Result<()> {
-        self.format(w, Severity::LOG_CRIT, message)
-    }
-
-    fn err<W: Write>(&mut self, w: &mut W, message: T) -> Result<()> {
-        self.format(w, Severity::LOG_ERR, message)
-    }
-
-    fn warning<W: Write>(&mut self, w: &mut W, message: T) -> Result<()> {
-        self.format(w, Severity::LOG_WARNING, message)
-    }
-
-    fn notice<W: Write>(&mut self, w: &mut W, message: T) -> Result<()> {
-        self.format(w, Severity::LOG_NOTICE, message)
-    }
-
-    fn info<W: Write>(&mut self, w: &mut W, message: T) -> Result<()> {
-        self.format(w, Severity::LOG_INFO, message)
-    }
-
-    fn debug<W: Write>(&mut self, w: &mut W, message: T) -> Result<()> {
-        self.format(w, Severity::LOG_DEBUG, message)
-    }
+    /// Format a single message. `timestamp` is the moment the event occurred; pass
+    /// `None` when it is unknown, which emits the RFC 5424 NILVALUE (`-`) in the
+    /// TIMESTAMP field rather than stamping the time of formatting.
+    fn format<W: Write>(
+        &self,
+        w: &mut W,
+        severity: Severity,
+        message: T,
+        timestamp: Option<OffsetDateTime>,
+    ) -> Result<()>;
 }
 
 /// RFC 5424 structured data
@@ -93,19 +89,21 @@ impl<T: Display> LogFormat<(u32, StructuredData, T)> for Formatter5424 {
         w: &mut W,
         severity: Severity,
         log_message: (u32, StructuredData, T),
+        timestamp: Option<OffsetDateTime>,
     ) -> Result<()> {
         let (message_id, data, message) = log_message;
 
-        // Guard against sub-second precision over 6 digits per rfc5424 section 6
-        let timestamp_now = time::OffsetDateTime::now_utc();
-        // Removing significant figures beyond 6 digits
-        let timestamp = timestamp_now
-            .replace_nanosecond(timestamp_now.nanosecond() / 1000 * 1000)
-            .unwrap_or(timestamp_now);
-
-        let ts_string = match timestamp.format(&time::format_description::well_known::Rfc3339) {
-            Ok(s) => s,
-            Err(_) => "-".to_string(),
+        let ts_string = match timestamp {
+            Some(timestamp) => {
+                // Guard against sub-second precision over 6 digits per rfc5424 section 6
+                let timestamp = timestamp
+                    .replace_nanosecond(timestamp.nanosecond() / 1000 * 1000)
+                    .unwrap_or(timestamp);
+                timestamp.format(&Rfc3339).unwrap_or_else(|_| "-".to_string())
+            }
+            // Time is not known (e.g. logged before the clock was synced, or recovered
+            // from a previous boot): emit the RFC 5424 NILVALUE.
+            None => "-".to_string(),
         };
 
         write!(
@@ -133,14 +131,11 @@ impl Default for Formatter5424 {
     /// The default settings are as follows:
     ///
     /// * `facility`: `LOG_USER`, as [specified by POSIX].
-    /// * `hostname`: Automatically detected using [the `hostname` crate], if possible.
-    /// * `process`: Automatically detected using [`std::env::current_exe`], or if that fails, an empty string.
-    /// * `pid`: Automatically detected using [`libc::getpid`].
+    /// * `hostname`: `None`.
+    /// * `process`: `"esp32"`.
+    /// * `pid`: `0`.
     ///
-    /// [`libc::getpid`]: https://docs.rs/libc/0.2/libc/fn.getpid.html
     /// [specified by POSIX]: https://pubs.opengroup.org/onlinepubs/9699919799/functions/closelog.html
-    /// [`std::env::current_exe`]: https://doc.rust-lang.org/std/env/fn.current_exe.html
-    /// [the `hostname` crate]: https://crates.io/crates/hostname
     fn default() -> Self {
         Self {
             facility: Facility::LOG_USER,
@@ -199,5 +194,18 @@ mod test {
         assert!(d.hostname.is_none());
 
         assert_eq!(d.process, "esp32");
+    }
+
+    #[test]
+    fn missing_timestamp_is_nilvalue() {
+        let formatter = Formatter5424::default();
+        let mut buf: Vec<u8> = Vec::new();
+        let data: StructuredData = BTreeMap::new();
+        formatter
+            .format(&mut buf, Severity::LOG_INFO, (1u32, data, "hi"), None)
+            .unwrap();
+        let line = String::from_utf8(buf).unwrap();
+        // The TIMESTAMP field (between version `1` and the hostname) must be the NILVALUE.
+        assert!(line.contains(">1 - "), "expected NILVALUE timestamp, got: {line}");
     }
 }
