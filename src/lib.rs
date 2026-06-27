@@ -70,7 +70,7 @@ const CHANNEL_CAPACITY: usize = 256;
 
 /// Reconnect cadence and per-operation timeouts for the worker thread.
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A captured log event handed from `log()` to the worker thread. The absolute time is
@@ -251,6 +251,12 @@ fn run_worker(rx: Receiver<Outgoing>, addr: SocketAddr, formatter: Formatter5424
                         spill.append(&out.to_record());
                     }
                     if let Some(mut candidate) = connect(&addr) {
+                        // Spill anything that queued during the blocking connect before
+                        // draining, so it is delivered in order and not left to overflow
+                        // the channel during the drain.
+                        while let Ok(out) = rx.try_recv() {
+                            spill.append(&out.to_record());
+                        }
                         if drain(&mut spill, &mut candidate, &formatter).is_ok() {
                             stream = Some(candidate);
                         }

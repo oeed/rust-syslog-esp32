@@ -171,6 +171,12 @@ impl SpillStore {
     pub fn clear(&mut self) {
         if std::fs::remove_file(&self.path).is_ok() || !self.path.exists() {
             self.count = 0;
+            return;
+        }
+        // Removal failed but the file is still present: truncate it to empty so its
+        // already-delivered records can't be re-drained and duplicated on the server.
+        if File::create(&self.path).is_ok() {
+            self.count = 0;
         }
     }
 
