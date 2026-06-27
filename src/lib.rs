@@ -215,7 +215,11 @@ fn drain(spill: &mut SpillStore, stream: &mut TcpStream, formatter: &Formatter54
         spill.clear();
         Ok(())
     } else {
-        spill.replace_with(&records[sent..]);
+        // Only rewrite when progress was made; with sent == 0 the file already holds
+        // exactly these records, so rewriting it would churn flash for nothing.
+        if sent > 0 {
+            spill.replace_with(&records[sent..]);
+        }
         Err(io::Error::new(io::ErrorKind::Other, "partial drain"))
     }
 }
@@ -295,7 +299,8 @@ pub fn init_tcp_ipv4(
 
     std::thread::Builder::new()
         .name("syslog".into())
-        .stack_size(12 * 1024)
+        // Headroom for the ESP-IDF socket + VFS/FATFS + formatting call stack.
+        .stack_size(16 * 1024)
         .spawn(move || run_worker(rx, addr, formatter, spill))
         .map_err(|e| Error::Initialization(Box::new(e)))?;
 
