@@ -147,8 +147,14 @@ impl SpillStore {
             // from a clean slate so a corrupt/oversized buffer can't wedge the device.
             store.clear();
         } else {
-            // Rewrite exactly the records we could parse (dropping any torn tail) and set
-            // the counters from them.
+            // Set the counters from what we actually parsed first, so they reflect the
+            // on-disk records even if the normalization rewrite below fails. Otherwise the
+            // store could report empty/under-size while the file still holds records,
+            // bypassing the byte cap and letting drain skip a non-empty buffer.
+            store.count = records.len();
+            store.bytes = total_bytes(&records);
+            // Best-effort: rewrite to drop any torn tail. On success this re-sets the same
+            // counters; on failure the file is left as-is and the values above still hold.
             store.replace_with(&records);
         }
         store
